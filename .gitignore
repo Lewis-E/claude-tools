@@ -1,2 +1,5 @@
+# Editor files
+.idea
+
 # OS files
 .DS_Store
