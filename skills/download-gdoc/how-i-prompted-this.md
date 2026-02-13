@@ -16,4 +16,4 @@
 
 8. After a couple of failed iterations, the LLM came up with an auth command that worked and we integrated it into the script. 
 
-Overall, you can see dev knowledge (gdrive, gcloud cli capabilities) were key to this process, but the actual code writing and iterative testing was easy to hand off. 
+Overall, you can see dev knowledge (gdrive, gcloud cli capabilities) were key to this process, but the actual code writing and iterative testing was easy to hand off.

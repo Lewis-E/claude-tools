@@ -14,6 +14,7 @@ gcloud auth application-default login to open a browser for authentication.
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,13 @@ from pathlib import Path
 import google.auth
 import google.auth.exceptions
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+_IMAGE_PATTERNS = re.compile(
+    r"!\[[^\]]*\]\([^\)]+\)\n*"          # inline: ![alt](url)
+    r"|!\[[^\]]*\]\[[^\]]+\]\n*"         # reference-use: ![alt][ref]
+    r"|\[[^\]]+\]:\s*<[^>]+>\n*",        # reference-def: [ref]: <data:...>
+)
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 GCLOUD_SCOPES = ",".join(SCOPES + ["https://www.googleapis.com/auth/cloud-platform"])
@@ -67,35 +75,60 @@ def get_cached_modified_time(doc_id: str) -> str | None:
     return None
 
 
+def _is_auth_error(exc: Exception) -> bool:
+    """Return True if the exception is an authentication/authorization failure."""
+    if isinstance(exc, HttpError) and exc.resp.status in (401, 403):
+        return True
+    if isinstance(exc, google.auth.exceptions.GoogleAuthError):
+        return True
+    msg = str(exc).lower()
+    return "invalid_grant" in msg or "expired" in msg
+
+
 def download_doc(doc_id_or_url: str, force: bool = False) -> Path:
     """Download a Google Doc to cache, returning the path to the .md file.
 
     Skips the export if the cached copy is up to date (unless force=True).
-    If the API call fails due to expired credentials, re-authenticates and retries.
+    If any API call fails due to expired credentials, re-authenticates and retries.
     """
-    creds = authenticate()
-    service = build("drive", "v3", credentials=creds)
-
     doc_id = extract_doc_id(doc_id_or_url)
     md_path = CACHE_DIR / f"{doc_id}.md"
     meta_path = CACHE_DIR / f"{doc_id}.meta.json"
 
-    # Get file metadata (cheap API call), re-auth on failure
-    try:
-        file_meta = (
-            service.files()
-            .get(fileId=doc_id, fields="name,modifiedTime")
-            .execute()
-        )
-    except google.auth.exceptions.RefreshError:
-        run_gcloud_login()
-        creds = authenticate()
-        service = build("drive", "v3", credentials=creds)
-        file_meta = (
-            service.files()
-            .get(fileId=doc_id, fields="name,modifiedTime")
-            .execute()
-        )
+    creds = authenticate()
+    service = build("drive", "v3", credentials=creds)
+
+    def _call(fn):
+        """Run an API call, re-auth once on auth failure."""
+        nonlocal service
+        try:
+            return fn(service)
+        except Exception as first_err:
+            if isinstance(first_err, HttpError) and first_err.resp.status == 404:
+                print(
+                    f"Error: Could not find document '{doc_id}'.\n"
+                    f"API response: {first_err}\n\n"
+                    "This usually means:\n"
+                    "  1. The doc hasn't been shared **directly** with your authenticated Google account, or\n"
+                    "  2. The GCP quota project may not have access to your org's Google Workspace.\n"
+                    "     (Docs shared within Datadog Workspace groups may require an authorized GCP project.)\n\n"
+                    "Try:\n"
+                    "  Copying the doc into your own google drive to have direct access.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if not _is_auth_error(first_err):
+                raise
+            print(f"Auth error: {first_err}", file=sys.stderr)
+            print("Re-authenticating...", file=sys.stderr)
+            run_gcloud_login()
+            service = build("drive", "v3", credentials=authenticate())
+            return fn(service)
+
+    # Get file metadata
+    file_meta = _call(
+        lambda svc: svc.files().get(fileId=doc_id, fields="name,modifiedTime").execute()
+    )
 
     remote_modified = file_meta["modifiedTime"]
     title = file_meta["name"]
@@ -108,13 +141,16 @@ def download_doc(doc_id_or_url: str, force: bool = False) -> Path:
             return md_path
 
     # Export as markdown
-    content = (
-        service.files()
+    content = _call(
+        lambda svc: svc.files()
         .export(fileId=doc_id, mimeType="text/markdown")
         .execute()
         .decode("utf-8")
         .strip()
     )
+
+    # Strip embedded images (large base64 data / hosted URLs not useful for LLMs)
+    content = _IMAGE_PATTERNS.sub("", content).strip()
 
     # Write cache
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
